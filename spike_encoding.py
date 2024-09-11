@@ -7,7 +7,6 @@ from scipy.signal import ShortTimeFFT
 
 # region tuning curves
 def convert_audio_to_spectrogram(waves, sr=16000, spec_method="mel"):
-
     # make sure waves is a numpy array
     if isinstance(waves, torch.Tensor):
         waves = waves.numpy()
@@ -27,7 +26,7 @@ def convert_audio_to_spectrogram(waves, sr=16000, spec_method="mel"):
     elif spec_method == "mel":
         # using mel spectrogram from librosa
         # sr = 16000
-        n_mels = 16
+        n_mels = 20
         n_fft = 2048
         hop_length = 252
         num_time_steps = (sr // hop_length) + 1
@@ -41,38 +40,90 @@ def convert_audio_to_spectrogram(waves, sr=16000, spec_method="mel"):
     # print("specs shape: ", specs.shape)
     # print("spec frequencies shape: ", spec_frequencies.shape)
     # print("spec frequencies", spec_frequencies)
-
     return specs, spec_frequencies
 
 
-def convert_spectogram_to_spike_trains(specs, spec_frequencies, kernels, spike_prob_scale=1.0):
+def apply_TCs_kernels(specs, spec_frequencies, kernels):
     batch_size, num_freqs, timesteps = specs.shape
     # normalize each spectrogram along the batch dimension
     specs = (specs - np.min(specs, axis=(1, 2), keepdims=True)) / (
         np.max(specs, axis=(1, 2), keepdims=True) - np.min(specs, axis=(1, 2), keepdims=True)
     )
-    spike_trains = np.zeros((batch_size, len(kernels), timesteps))
 
+    filtered_specs = np.zeros((batch_size, len(kernels), timesteps))
     for i in range(batch_size):
         for idx, k in enumerate(kernels):
             k = np.interp(spec_frequencies, np.arange(len(k)), k)
-            scaled_kernel = k * spike_prob_scale
             # filter the spectrogram with the kernel by multiplying element-wise along the time axis
-            spike_probs = np.apply_along_axis(lambda x: x * scaled_kernel, 0, specs[i])
-
+            spike_probs = np.apply_along_axis(lambda x: x * k, 0, specs[i])
             spike_probs = np.average(spike_probs, weights=k, axis=0)
+            filtered_specs[i, idx, ...] = spike_probs
 
-            spike_train = np.random.poisson(spike_probs)
-            spike_train = np.clip(spike_train, 0, 1)
-            spike_trains[i, idx, ...] = spike_train
+    return filtered_specs
+
+
+def generate_poison_spike_trains(spike_probs, spike_prob_scale=1.0):
+    spike_probs = spike_probs * spike_prob_scale
+    max_pois_val = 100
+    spike_probs = np.clip(spike_probs, 0, max_pois_val)
+    spike_trains = np.random.poisson(spike_probs)
+    spike_trains = np.clip(spike_trains, 0, 1)
 
     return spike_trains
 
 
 def encode_to_spikes_TCs(waves, kernels, sr=16000, spec_method="mel", spike_prob_scale=1.0):
     specs, spec_frequencies = convert_audio_to_spectrogram(waves, sr, spec_method)
-    spike_trains = convert_spectogram_to_spike_trains(specs, spec_frequencies, kernels, spike_prob_scale)
-    return spike_trains, specs, spec_frequencies
+    spike_probs = apply_TCs_kernels(specs, spec_frequencies, kernels)
+    spike_trains = generate_poison_spike_trains(spike_probs, spike_prob_scale)
+    # spike_trains, spike_probs = np.zeros_like(specs), np.zeros_like(specs)
+    return spike_trains, spike_probs, specs, spec_frequencies
+
+
+# region IF encoding
+import torch
+import numpy as np
+from spikingjelly.activation_based import neuron, functional
+
+
+def encode_spec_to_spikes_IF(specs, tau_m=20.0, R=1.0, V_th=1.0, V_reset=0.0):
+    batch_size, num_freqs, timesteps = specs.shape
+
+    # Normalizing spectrogram
+    specs = torch.from_numpy(specs)
+    # normalize each spectrogram along the batch dimension
+    # Normalize each spectrogram along the batch dimension (dim 1 and dim 2)
+    specs = (specs - specs.min(dim=1, keepdim=True)[0].min(dim=2, keepdim=True)[0]) / (
+        specs.max(dim=1, keepdim=True)[0].max(dim=2, keepdim=True)[0]
+        - specs.min(dim=1, keepdim=True)[0].min(dim=2, keepdim=True)[0]
+    )
+
+    # Create IF neurons
+    lif_neurons = neuron.IFNode(v_threshold=V_th, v_reset=V_reset)
+    functional.set_step_mode(lif_neurons, "m")
+    # Simulating the neuron response
+    spike_trains = []
+    for t in range(timesteps):
+        # Apply input to neurons
+        input_current = specs[:, :, t] / tau_m  # Scale input as per membrane time constant
+        spikes = lif_neurons(input_current)
+        spike_trains.append(spikes)
+
+    # Resetting the neuron states after processing
+    functional.reset_net(lif_neurons)
+
+    # Stacking to form the batch x num_freqs x timesteps tensor
+    spike_trains = torch.stack(spike_trains, dim=2)
+
+    return spike_trains.numpy()
+
+
+def encode_to_spikes_IF(data, sr, kernels, tau_m=20.0, R=1.0, V_th=1.0, V_reset=0.0):
+    specs, freqs = convert_audio_to_spectrogram(data, sr, spec_method="mel")
+    specs = apply_TCs_kernels(specs, freqs, kernels)
+    spike_trains = encode_spec_to_spikes_IF(specs, tau_m, R, V_th, V_reset)
+
+    return spike_trains, specs, freqs
 
 
 # region rbf

@@ -140,3 +140,43 @@ class customSNet_1(nn.Module):
             mem5_rec.append(mem5)
 
         return torch.stack(spk5_rec), torch.stack(mem5_rec)
+
+
+# region spikingjelly
+import torch
+import torch.nn as nn
+from copy import deepcopy
+from spikingjelly.activation_based import layer
+
+
+class SJNetwork(nn.Module):
+    def __init__(self, channels=128, output_size=10, spiking_neuron: callable = None, **kwargs):
+        super().__init__()
+        voting_pool = 4
+        size_last_linear = output_size * voting_pool
+        conv = [
+            layer.Conv1d(1, channels, kernel_size=3, padding=1, bias=False),
+            layer.BatchNorm1d(channels),
+            spiking_neuron(**deepcopy(kwargs)),
+            layer.MaxPool1d(2),
+            layer.Conv1d(channels, channels, kernel_size=3, padding=1, bias=False),
+            layer.BatchNorm1d(channels),
+            spiking_neuron(**deepcopy(kwargs)),
+            layer.MaxPool1d(2),
+        ]
+        self.conv_fc = nn.Sequential(
+            *conv,
+            layer.Flatten(),
+            layer.Dropout(0.5),
+            # layer.Linear(channels * 4 * 4, 512),
+            layer.Linear(channels * 4, 128),
+            spiking_neuron(**deepcopy(kwargs)),
+            layer.Dropout(0.5),
+            layer.Linear(128, size_last_linear),
+            spiking_neuron(**deepcopy(kwargs)),
+            layer.VotingLayer(voting_pool)
+        )
+
+    def forward(self, x: torch.Tensor):
+        x = self.conv_fc(x)
+        return x
