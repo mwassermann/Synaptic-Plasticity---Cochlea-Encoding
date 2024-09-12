@@ -9,4 +9,6 @@ Jesse König
 Lane Tiberius von Bassewitz
 Max Wassermann
 
-![](pipeline.png)
+### see *audio_command_snn.ipynb* for the main code 
+
+![](images/pipeline.png)
